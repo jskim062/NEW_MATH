@@ -5,15 +5,18 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # Use the latest Google GenAI SDK
+from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
 # Load environment variables
 load_dotenv()
 
-# Configuration
-INPUT_DIR = Path("problems")
-OUTPUT_DIR = Path("solutions")
+# Configuration - robust paths
+SCRIPT_DIR = Path(__file__).parent
+BASE_DIR = SCRIPT_DIR.parent
+INPUT_DIR = BASE_DIR / "problems"
+OUTPUT_DIR = BASE_DIR / "solutions"
 OCR_MODEL = "gemini-3.1-flash-image-preview"
 SOLVE_MODEL = "gemini-3.1-pro-preview"
 #SOLVE_MODEL = "gemini-2.5-pro"
@@ -70,6 +73,7 @@ SOLVE_PROMPT = """You are an elite mathematical problem solver with expertise at
 
 # LaTeX Formatting Rules:
 - When writing a limit or a sum, ALWAYS use `\lim\limits_{...}` or `\sum\limits_{...}` instead of just `\lim_{...}` or `\sum_{...}` so that the conditions/indices appear properly underneath the operator.
+- **[CRITICAL]**: Every single mathematical expression, variable (like $x$, $n$, $f(x)$), number, or constant in your reasoning and final answer MUST be enclosed in LaTeX delimiters. Use single `$` for inline math and double `$$` for block math. Do not omit delimiters even for simple numbers.
 
 # Verification Requirements:
 - Cross-check arithmetic and algebraic manipulations
@@ -87,7 +91,7 @@ Generate the final response in a structured format as follows:
     - Mention any common pitfalls or "traps" students might fall into for this specific problem.
 5. **Core Logic & Idea**: Identify the most critical turning point or insight in the problem (the 'Aha!' moment). Explain "what kind of idea or insight was absolutely necessary" to break through the problem."""
 
-from pydantic import BaseModel, Field
+import sqlite3
 
 class MathProblem(BaseModel):
     problem_number: str = Field(description="인식된 문제 번호 (숫자만)")
@@ -98,12 +102,101 @@ class MathProblem(BaseModel):
     post_solution_reflection: str = Field(description="학생들이 자주 하는 실수나 함정 등 풀이 후 고찰")
     core_logic: str = Field(description="이 문제를 파훼하기 위해 반드시 필요했던 핵심 발상(Idea)이나 통찰")
 
-def process_math_problem(file_path: Path):
+# Database constants
+DB_FILE = BASE_DIR / "problems.db"
+DB_ANALYSIS_MODEL = "gemini-3-pro-preview"
+
+def update_database_with_analysis(problem_data: dict, source_file: str):
+    """Analyzes the problem further for DB layers and saves to problems.db."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        # 1. Check if already exists to avoid redundant API calls
+        cursor.execute("SELECT id FROM ProblemAnalysis WHERE source_file = ? AND problem_number = ?", 
+                      (source_file, problem_data["problem_number"]))
+        if cursor.fetchone():
+            conn.close()
+            return
+
+        # 2. Extract layers using the same logic as db_builder.py but for a single problem
+        from .db_builder import SYSTEM_PROMPT as DB_SYSTEM_PROMPT
+        
+        problem_content_for_db = f"""
+### 📝 Original Problem (Transcribed)
+{problem_data.get('transcription', 'N/A')}
+
+### 🧠 Analysis of Key Concepts
+{problem_data.get('analysis_of_key_concepts', 'N/A')}
+
+### 💡 Step-by-Step Reasoning
+{problem_data.get('step_by_step_reasoning', 'N/A')}
+
+### ✅ Final Answer
+{problem_data.get('final_answer', 'N/A')}
+
+### 🧐 Post-Solution Reflection
+{problem_data.get('post_solution_reflection', 'N/A')}
+"""
+        
+        response = client.models.generate_content(
+            model=DB_ANALYSIS_MODEL,
+            contents=[DB_SYSTEM_PROMPT, "다음은 분석할 기출 문항의 해설 데이터입니다:\n\n" + problem_content_for_db],
+            config=types.GenerateContentConfig(temperature=0.1, response_mime_type="application/json")
+        )
+        
+        analysis = json.loads(response.text)
+        if isinstance(analysis, list) and len(analysis) > 0:
+            analysis = analysis[0]
+            
+        # 3. Insert into DB
+        cursor.execute('''
+            INSERT OR REPLACE INTO ProblemAnalysis 
+            (source_file, problem_number, original_content, layer_a, layer_b, layer_c, trap_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            source_file,
+            problem_data["problem_number"],
+            problem_content_for_db,
+            analysis.get('Layer_A', ''),
+            analysis.get('Layer_B', ''),
+            analysis.get('Layer_C', ''),
+            analysis.get('Trap_Data', '')
+        ))
+        conn.commit()
+        conn.close()
+        print(f"  -> Problem {problem_data['problem_number']} auto-indexed to DB.")
+    except Exception as e:
+        print(f"Failed to auto-index problem to DB: {e}")
+
+def get_processed_pages(filepath: Path) -> set[int]:
+    """Reads the solution file and returns a set of processed page numbers."""
+    if not filepath.exists():
+        return set()
+    
+    import re
+    processed_pages = set()
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+            # Find all <!-- page: N --> markers
+            matches = re.finditer(r"<!-- page: (\d+) -->", content)
+            for match in matches:
+                processed_pages.add(int(match.group(1)))
+    except Exception as e:
+        print(f"Error reading processed pages from {filepath}: {e}")
+    
+    return processed_pages
+
+def process_math_problem(file_path: Path, processed_pages: set[int] = None):
     """
     Step 1: Upload PDF and use flash-image for OCR.
     Step 2: Use pro-preview to solve the transcribed problem and output JSON.
     Yields results page by page.
     """
+    if processed_pages is None:
+        processed_pages = set()
+        
     print(f"Processing: {file_path.name}...")
     try:
         import fitz  # PyMuPDF
@@ -112,6 +205,10 @@ def process_math_problem(file_path: Path):
         doc = fitz.open(file_path)
         
         for page_num in range(len(doc)):
+            if (page_num + 1) in processed_pages:
+                print(f"Skipping Page {page_num + 1}/{len(doc)} (Already processed)")
+                continue
+                
             print(f"\n--- Processing Page {page_num + 1}/{len(doc)} ---")
             
             # Save the single page as a temporary PDF
@@ -201,7 +298,7 @@ def process_math_problem(file_path: Path):
             
             # Yield the results for this specific page so they can be viewed/saved immediately
             if page_data_list:
-                yield page_data_list
+                yield (page_num + 1), page_data_list
         
         doc.close()
         
@@ -211,36 +308,70 @@ def process_math_problem(file_path: Path):
         traceback.print_exc()
         yield None
 
-def save_solutions_to_single_file(all_results: list[dict], original_filename: str):
-    """Saves all solution data to a single markdown file."""
+def save_solutions_incremental(page_results: list[dict], original_filename: str, page_num: int):
+    """Appends solution data for a specific page to the markdown file."""
     filename = f"{Path(original_filename).stem}_solutions.md"
     filepath = OUTPUT_DIR / filename
     
-    markdown_content = f"# Solutions for {original_filename}\n\n"
+    is_new_file = not filepath.exists()
     
-    for data in all_results:
+    markdown_content = ""
+    if is_new_file:
+        markdown_content += f"# Solutions for {original_filename}\n\n"
+        markdown_content += "> [!NOTE]\n"
+        markdown_content += "> 이 해설은 AI_KICE 시스템에 의해 생성되었습니다. 실시간으로 분석 내용이 업데이트됩니다.\n\n"
+    else:
+        markdown_content += "\n\n---\n"
+    
+    markdown_content += f"### [Page {page_num}]\n\n"
+    
+    for data in page_results:
+        # Auto-index each problem to the database
+        update_database_with_analysis(data, original_filename)
+        
         problem_num = data.get("problem_number", "0")
-        markdown_content += f"## Problem {problem_num}\n\n"
+        markdown_content += f"#### Problem {problem_num}\n\n"
         
         transcription = data.get('transcription', 'N/A')
-        # Ensure it doesn't just say 'N/A' if it couldn't find it easily
         if not transcription or transcription == "N/A":
-            markdown_content += f"### 📝 Original Problem (Transcribed)\n*원문을 불러오지 못했습니다.*\n\n---\n\n"
+            markdown_content += f"**📝 Original Problem (Transcribed)**\n*원문을 불러오지 못했습니다.*\n\n"
         else:
-            markdown_content += f"### 📝 Original Problem (Transcribed)\n{transcription}\n\n---\n\n"
+            markdown_content += f"**📝 Original Problem (Transcribed)**\n{transcription}\n\n"
             
-        markdown_content += f"### 🧠 Analysis of Key Concepts\n{data.get('analysis_of_key_concepts', 'N/A')}\n\n---\n\n"
-        markdown_content += f"### 💡 Step-by-Step Reasoning\n{data.get('step_by_step_reasoning', 'N/A')}\n\n---\n\n"
-        markdown_content += f"### ✅ Final Answer\n**{data.get('final_answer', 'N/A')}**\n\n---\n\n"
-        markdown_content += f"### 🧐 Post-Solution Reflection\n{data.get('post_solution_reflection', 'N/A')}\n\n---\n\n"
-        markdown_content += f"### 🗝️ 필수 발상 (Core Insight & Idea)\n{data.get('core_logic', 'N/A')}\n\n<br><br>\n\n"
+        markdown_content += f"**🧠 Analysis of Key Concepts**\n{data.get('analysis_of_key_concepts', 'N/A')}\n\n"
+        markdown_content += f"**💡 Step-by-Step Reasoning**\n{data.get('step_by_step_reasoning', 'N/A')}\n\n"
+        markdown_content += f"**✅ Final Answer**\n**{data.get('final_answer', 'N/A')}**\n\n"
+        markdown_content += f"**🧐 Post-Solution Reflection**\n{data.get('post_solution_reflection', 'N/A')}\n\n"
+        markdown_content += f"**🗝️ 필수 발상 (Core Insight & Idea)**\n{data.get('core_logic', 'N/A')}\n\n"
+    
+    # Add the page marker for resumability
+    markdown_content += f"\n<!-- page: {page_num} -->\n"
         
     try:
-        with open(filepath, "w", encoding="utf-8") as f:
+        with open(filepath, "a", encoding="utf-8") as f:
             f.write(markdown_content)
-        print(f"Saved all solutions to {filepath}")
+        print(f"Appended solutions for Page {page_num} to {filepath}")
     except Exception as e:
         print(f"Error saving to {filepath}: {e}")
+
+def solve_single_pdf(file_path: Path):
+    """Processes a single PDF and saves its solutions."""
+    filename = f"{file_path.stem}_solutions.md"
+    filepath = OUTPUT_DIR / filename
+    
+    processed_pages = get_processed_pages(filepath)
+    if processed_pages:
+        print(f"Resuming analysis for {file_path.name}. Found {len(processed_pages)} processed pages.")
+    
+    all_results = [] # We won't return full results here since we append to file
+    
+    # Since process_math_problem is now a generator, we iterate over it page by page
+    for page_num, page_results in process_math_problem(file_path, processed_pages):
+        if page_results:
+            save_solutions_incremental(page_results, file_path.name, page_num)
+            all_results.extend(page_results)
+            
+    return all_results
 
 def main():
     print("Starting Math Problem Solver (Dual Model Version)...")
@@ -256,19 +387,7 @@ def main():
     print(f"Found {len(files)} PDF(s) to process.")
     
     for file_path in files:
-        all_results = []
-        # Since process_math_problem is now a generator, we iterate over it page by page
-        for page_results in process_math_problem(file_path):
-            if page_results:
-                all_results.extend(page_results)
-                
-                # Save incrementally after each page so users can view progress
-                current_results = list(all_results)
-                try:
-                    current_results.sort(key=lambda x: int(str(x.get("problem_number", "0")).replace(".", "").strip()))
-                except Exception:
-                    pass
-                save_solutions_to_single_file(current_results, file_path.name)
+        solve_single_pdf(file_path)
             
     print("🎉 All tasks completed!")
 

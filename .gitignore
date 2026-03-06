@@ -7,11 +7,12 @@ __pycache__/
 *$py.class
 
 # Generated Content & Data
-problems/*.pdf
-solutions/*.md
-generated/*.md
+*.pdf
 *.db
-
+*.sqlite3
+data/
+solutions/
+generated/
 # Virtual environments
 venv/
 env/

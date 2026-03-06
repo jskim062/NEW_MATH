@@ -7,9 +7,11 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-# Setup Directories
-SOLUTIONS_DIR = Path("solutions")
-DB_FILE = "problems.db"
+# Setup Directories - robust paths relative to script
+SCRIPT_DIR = Path(__file__).parent
+BASE_DIR = SCRIPT_DIR.parent
+SOLUTIONS_DIR = BASE_DIR / "solutions"
+DB_FILE = BASE_DIR / "problems.db"
 
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
